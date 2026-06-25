@@ -44,15 +44,16 @@
     <button class="btn" id="zout">－</button>
     <button class="btn" id="fit">Fit</button>
   </span>
-  <button class="btn" id="undo">Undo poly</button>
-  <button class="btn warn" id="del">Del last</button>
+  <button class="btn go" id="finish">✓ Finish</button>
+  <button class="btn" id="undo">↶ Undo stroke</button>
+  <button class="btn warn" id="delpoly">Del last poly</button>
   <button class="btn" id="clear">Clear img</button>
   <button class="btn go" id="export">⬇︎ Export .txt</button>
   <button class="btn" id="exportAll">⬇︎ All (JSON)</button>
 </div>
 <div id="wrap"><canvas id="cv"></canvas></div>
 <div id="status">Load a batch of images to start.</div>
-<div id="hint">✏️ Pencil = trace a part &nbsp;•&nbsp; ✌️ two fingers = pinch-zoom &nbsp;•&nbsp; ☝️ one finger = pan</div>
+<div id="hint">✏️ Trace in pieces — lift anytime &nbsp;•&nbsp; ✓ Finish to close &nbsp;•&nbsp; ✌️ pinch-zoom &nbsp;•&nbsp; ☝️ pan</div>
 
 <script>
 // ---- classes (index order MUST match the segmenter: T1..T7, M1..M4, main_beam, burr) ----
@@ -67,8 +68,9 @@ let cur=-1;
 let labels={};          // name -> [{cls, pts:[[x,y],...] in IMAGE pixels}]
 let active=0;
 let view={scale:1, ox:0, oy:0};
-let drawingPts=null;    // freehand path in image coords while pen is down
+let drawStrokes=null;   // in-progress polygon = array of pen strokes; lift the pen between strokes, ✓ Finish to close
 const SIMPLIFY_PX = 3;  // min pixel spacing between captured points (image space)
+function curDrawPts(){ return drawStrokes ? drawStrokes.flat() : []; }
 
 // ---------- palette ----------
 const pal=document.getElementById('palette');
@@ -132,8 +134,8 @@ function render(){
   ctx.drawImage(im.img, view.ox, view.oy, im.w*view.scale, im.h*view.scale);
   // committed polygons
   curPolys().forEach(p=>drawPoly(p.pts, COLORS[p.cls], true, CLASSES[p.cls]));
-  // in-progress
-  if(drawingPts && drawingPts.length){ drawPoly(drawingPts, COLORS[active], false); }
+  // in-progress (multi-stroke; stays open until you tap ✓ Finish)
+  if(drawStrokes){ const fp=curDrawPts(); if(fp.length){ drawPoly(fp, COLORS[active], false); drawStartDot(fp[0]); } }
 }
 function drawPoly(pts, color, closed, label){
   if(pts.length<1) return;
@@ -149,6 +151,12 @@ function drawPoly(pts, color, closed, label){
     ctx.fillText(label, lx+4, ly-4);
   }
 }
+function drawStartDot(pt){ // white anchor at the start point so you can see where Finish will close to
+  const [sx,sy]=i2s(pt[0],pt[1]);
+  ctx.beginPath(); ctx.arc(sx,sy,5*DPR,0,Math.PI*2);
+  ctx.fillStyle='#fff'; ctx.fill();
+  ctx.lineWidth=2*DPR; ctx.strokeStyle='#000'; ctx.stroke();
+}
 
 // ---------- pointer handling: PEN draws, TOUCH pans/zooms ----------
 const pts=new Map(); // active touch pointers
@@ -156,7 +164,9 @@ let panLast=null, pinchBase=null;
 cv.addEventListener('pointerdown', e=>{
   cv.setPointerCapture(e.pointerId);
   if(e.pointerType==='pen' || e.pointerType==='mouse'){
-    drawingPts=[]; pushPenPoint(e); render();
+    if(!drawStrokes) drawStrokes=[];   // start a new polygon only if none is in progress
+    drawStrokes.push([]);              // begin a fresh stroke
+    pushPenPoint(e); render(); status();
   } else if(e.pointerType==='touch'){
     pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
     if(pts.size===1){ panLast={x:e.clientX,y:e.clientY}; }
@@ -164,7 +174,7 @@ cv.addEventListener('pointerdown', e=>{
   }
 });
 cv.addEventListener('pointermove', e=>{
-  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawingPts){
+  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawStrokes){
     pushPenPoint(e); render();
   } else if(e.pointerType==='touch' && pts.has(e.pointerId)){
     pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
@@ -181,9 +191,8 @@ cv.addEventListener('pointermove', e=>{
   }
 });
 function endPtr(e){
-  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawingPts){
-    if(drawingPts.length>=3){ curPolys().push({cls:active, pts:drawingPts}); save(); }
-    drawingPts=null; render(); status();
+  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawStrokes){
+    render(); status();   // stroke ends; polygon stays OPEN — lift, zoom in, keep tracing, then tap ✓ Finish
   } else if(e.pointerType==='touch'){
     pts.delete(e.pointerId);
     if(pts.size<2) pinchBase=null;
@@ -197,8 +206,9 @@ cv.addEventListener('pointerleave', e=>{ if(e.pointerType==='mouse'&&drawingPts)
 function pushPenPoint(e){
   const r=cv.getBoundingClientRect();
   const [ix,iy]=s2i(e.clientX-r.left, e.clientY-r.top);
-  const last=drawingPts[drawingPts.length-1];
-  if(!last || Math.hypot(ix-last[0],iy-last[1])>=SIMPLIFY_PX){ drawingPts.push([ix,iy]); }
+  const stroke=drawStrokes[drawStrokes.length-1];
+  const last=stroke[stroke.length-1];
+  if(!last || Math.hypot(ix-last[0],iy-last[1])>=SIMPLIFY_PX){ stroke.push([ix,iy]); }
 }
 function pinchState(){
   const a=[...pts.values()];
@@ -211,13 +221,26 @@ function zoomAtCss(cssx,cssy,factor){
 }
 
 // ---------- controls ----------
-document.getElementById('prev').onclick=()=>{ if(cur>0){cur--;fit();status();} };
-document.getElementById('next').onclick=()=>{ if(cur<images.length-1){cur++;fit();status();} };
+function finishPoly(){
+  if(!drawStrokes) return;
+  const fp=curDrawPts();
+  if(fp.length>=3){ curPolys().push({cls:active, pts:fp}); save(); }
+  drawStrokes=null; render(); status();
+}
+function undoStroke(){
+  if(drawStrokes && drawStrokes.length){            // mid-polygon: drop the last pen stroke
+    drawStrokes.pop(); if(!drawStrokes.length) drawStrokes=null;
+  } else { curPolys().pop(); save(); }               // not drawing: drop the last finished polygon
+  render(); status();
+}
+document.getElementById('prev').onclick=()=>{ if(cur>0){drawStrokes=null;cur--;fit();status();} };
+document.getElementById('next').onclick=()=>{ if(cur<images.length-1){drawStrokes=null;cur++;fit();status();} };
 document.getElementById('zin').onclick=()=>zoomAt(cv.width/2,cv.height/2,1.25);
 document.getElementById('zout').onclick=()=>zoomAt(cv.width/2,cv.height/2,0.8);
 document.getElementById('fit').onclick=fit;
-document.getElementById('undo').onclick=()=>{ curPolys().pop(); save(); render(); status(); };
-document.getElementById('del').onclick=()=>{ curPolys().pop(); save(); render(); status(); };
+document.getElementById('finish').onclick=finishPoly;
+document.getElementById('undo').onclick=undoStroke;
+document.getElementById('delpoly').onclick=()=>{ curPolys().pop(); save(); render(); status(); };
 document.getElementById('clear').onclick=()=>{ if(confirm('Clear all polygons on this image?')){ labels[curName()]=[]; save(); render(); status(); } };
 
 // YOLO-seg: "<cls> x1 y1 x2 y2 ..." normalized 0..1
@@ -252,8 +275,9 @@ function status(){
   const n=curName();
   const total=Object.values(labels).reduce((a,b)=>a+(b?b.length:0),0);
   document.getElementById('imgname').textContent = n? `${cur+1}/${images.length}  ${n}` : 'no image';
+  const drawing = drawStrokes ? `  •  ✏️ drawing ${CLASSES[active]} (${drawStrokes.length} strokes) — tap ✓ Finish` : '';
   document.getElementById('status').textContent =
-    n ? `Active class: ${CLASSES[active]}  •  this image: ${curPolys().length} polys  •  saved total: ${total}`
+    n ? `Active class: ${CLASSES[active]}  •  this image: ${curPolys().length} polys  •  saved total: ${total}${drawing}`
       : 'Load a batch of images to start.';
 }
 resize(); status();
