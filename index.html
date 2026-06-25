@@ -73,6 +73,7 @@ let active=0;
 let ordSeq=0;           // monotonic load-order counter so restored images keep their order
 let view={scale:1, ox:0, oy:0};
 let drawStrokes=null;   // in-progress polygon = array of pen strokes; lift the pen between strokes, ✓ Finish to close
+let penDown=false;      // true only while the tip is touching glass (ignores Apple Pencil hover)
 const SIMPLIFY_PX = 3;  // min pixel spacing between captured points (image space)
 function curDrawPts(){ return drawStrokes ? drawStrokes.flat() : []; }
 
@@ -177,6 +178,7 @@ let panLast=null, pinchBase=null;
 cv.addEventListener('pointerdown', e=>{
   cv.setPointerCapture(e.pointerId);
   if(e.pointerType==='pen' || e.pointerType==='mouse'){
+    penDown=true;
     if(!drawStrokes) drawStrokes=[];   // start a new polygon only if none is in progress
     drawStrokes.push([]);              // begin a fresh stroke
     pushPenPoint(e); render(); status();
@@ -187,7 +189,7 @@ cv.addEventListener('pointerdown', e=>{
   }
 });
 cv.addEventListener('pointermove', e=>{
-  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawStrokes){
+  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawStrokes && penDown){
     pushPenPoint(e); render();
   } else if(e.pointerType==='touch' && pts.has(e.pointerId)){
     pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
@@ -204,8 +206,9 @@ cv.addEventListener('pointermove', e=>{
   }
 });
 function endPtr(e){
-  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawStrokes){
-    render(); status();   // stroke ends; polygon stays OPEN — lift, zoom in, keep tracing, then tap ✓ Finish
+  if(e.pointerType==='pen'||e.pointerType==='mouse'){
+    penDown=false;        // tip left the glass; stop capturing (hover is ignored)
+    if(drawStrokes){ render(); status(); }  // polygon stays OPEN — lift, zoom in, keep tracing, then tap ✓ Finish
   } else if(e.pointerType==='touch'){
     pts.delete(e.pointerId);
     if(pts.size<2) pinchBase=null;
