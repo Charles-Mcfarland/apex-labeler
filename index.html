@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>APEX Polygon Labeler</title>
+<style>
+  :root{ --bg:#111; --panel:#1b1b1f; --ink:#eee; --accent:#39d353; }
+  *{ box-sizing:border-box; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  html,body{ margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:14px -apple-system,Segoe UI,Roboto,sans-serif; overflow:hidden; }
+  #bar{ display:flex; flex-wrap:wrap; gap:6px; padding:6px 8px; background:var(--panel);
+    align-items:center; border-bottom:1px solid #000; }
+  .cls{ padding:8px 10px; border-radius:8px; border:2px solid transparent; color:#000;
+    font-weight:700; min-width:42px; text-align:center; touch-action:manipulation; }
+  .cls.active{ border-color:#fff; box-shadow:0 0 0 2px #000 inset; }
+  .btn{ padding:8px 12px; border-radius:8px; background:#2a2a30; color:var(--ink);
+    border:1px solid #3a3a42; font-weight:600; touch-action:manipulation; }
+  .btn:active{ background:#3a3a42; }
+  .btn.warn{ background:#5a1f1f; border-color:#7a2a2a; }
+  .btn.go{ background:#1f5a2f; border-color:#2a7a3f; }
+  #wrap{ position:absolute; top:auto; left:0; right:0; bottom:0; }
+  #cv{ display:block; touch-action:none; background:#000; }
+  #status{ position:fixed; left:8px; bottom:8px; background:rgba(0,0,0,.6);
+    padding:6px 10px; border-radius:8px; font-size:13px; pointer-events:none; max-width:60vw; }
+  #hint{ position:fixed; right:8px; bottom:8px; background:rgba(0,0,0,.6);
+    padding:6px 10px; border-radius:8px; font-size:12px; color:#aaa; pointer-events:none; }
+  label.load{ display:inline-block; }
+  input[type=file]{ display:none; }
+  #zoomctl .btn{ min-width:40px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <label class="load btn go">⬆︎ Load images<input id="file" type="file" accept="image/*" multiple></label>
+  <span id="nav" style="display:flex;gap:4px;align-items:center">
+    <button class="btn" id="prev">◀</button>
+    <span id="imgname" style="min-width:120px;text-align:center;font-size:12px">no image</span>
+    <button class="btn" id="next">▶</button>
+  </span>
+  <span id="palette" style="display:flex;flex-wrap:wrap;gap:4px"></span>
+  <span id="zoomctl" style="display:flex;gap:4px">
+    <button class="btn" id="zin">＋</button>
+    <button class="btn" id="zout">－</button>
+    <button class="btn" id="fit">Fit</button>
+  </span>
+  <button class="btn" id="undo">Undo poly</button>
+  <button class="btn warn" id="del">Del last</button>
+  <button class="btn" id="clear">Clear img</button>
+  <button class="btn go" id="export">⬇︎ Export .txt</button>
+  <button class="btn" id="exportAll">⬇︎ All (JSON)</button>
+</div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="status">Load a batch of images to start.</div>
+<div id="hint">✏️ Pencil = trace a part &nbsp;•&nbsp; ✌️ two fingers = pinch-zoom &nbsp;•&nbsp; ☝️ one finger = pan</div>
+
+<script>
+// ---- classes (index order MUST match the segmenter: T1..T7, M1..M4, main_beam, burr) ----
+const CLASSES = ['T1','T2','T3','T4','T5','T6','T7','M1','M2','M3','M4','main_beam','burr'];
+const COLORS  = ['#ff5d5d','#ff9f43','#ffd93d','#6bff6b','#3dd7c7','#4db5ff','#7c83ff',
+                 '#c86bff','#ff6bd6','#ff9bb3','#b0ffd0','#9be7ff','#bbbbbb'];
+
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const DPR = Math.max(1, window.devicePixelRatio||1);
+let images=[];          // {name, img, w, h}
+let cur=-1;
+let labels={};          // name -> [{cls, pts:[[x,y],...] in IMAGE pixels}]
+let active=0;
+let view={scale:1, ox:0, oy:0};
+let drawingPts=null;    // freehand path in image coords while pen is down
+const SIMPLIFY_PX = 3;  // min pixel spacing between captured points (image space)
+
+// ---------- palette ----------
+const pal=document.getElementById('palette');
+CLASSES.forEach((c,i)=>{
+  const b=document.createElement('div'); b.className='cls'; b.textContent=c;
+  b.style.background=COLORS[i]; b.dataset.i=i;
+  b.onclick=()=>{ active=i; refreshPalette(); status(); };
+  pal.appendChild(b);
+});
+function refreshPalette(){ [...pal.children].forEach((b,i)=>b.classList.toggle('active', i===active)); }
+refreshPalette();
+
+// ---------- sizing ----------
+function resize(){
+  const top = document.getElementById('bar').getBoundingClientRect().height;
+  const w = window.innerWidth, h = window.innerHeight - top;
+  document.getElementById('wrap').style.top = top+'px';
+  cv.style.width=w+'px'; cv.style.height=h+'px';
+  cv.width = Math.round(w*DPR); cv.height = Math.round(h*DPR);
+  render();
+}
+window.addEventListener('resize', resize);
+
+// ---------- load ----------
+document.getElementById('file').addEventListener('change', e=>{
+  const files=[...e.target.files].filter(f=>f.type.startsWith('image/'));
+  let loaded=0;
+  files.forEach(f=>{
+    const img=new Image();
+    img.onload=()=>{ images.push({name:f.name, img, w:img.naturalWidth, h:img.naturalHeight});
+      loaded++; if(loaded===files.length){ if(cur<0){cur=0; fit();} status(); } };
+    img.src=URL.createObjectURL(f);
+  });
+});
+
+function curName(){ return cur>=0 ? images[cur].name : null; }
+function curPolys(){ const n=curName(); if(!n) return []; return (labels[n]||(labels[n]=[])); }
+
+// ---------- view transform ----------
+function fit(){
+  if(cur<0) return;
+  const im=images[cur];
+  const s=Math.min(cv.width/im.w, cv.height/im.h)*0.96;
+  view.scale=s; view.ox=(cv.width-im.w*s)/2; view.oy=(cv.height-im.h*s)/2;
+  render();
+}
+function s2i(x,y){ return [(x*DPR-view.ox)/view.scale, (y*DPR-view.oy)/view.scale]; } // CSS px -> image px
+function i2s(x,y){ return [x*view.scale+view.ox, y*view.scale+view.oy]; }              // image px -> canvas px
+function zoomAt(cx,cy,factor){ // cx,cy in canvas px
+  const [ix,iy]=[(cx-view.ox)/view.scale,(cy-view.oy)/view.scale];
+  view.scale*=factor;
+  view.ox=cx-ix*view.scale; view.oy=cy-iy*view.scale; render();
+}
+
+// ---------- render ----------
+function render(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(cur<0){ return; }
+  const im=images[cur];
+  ctx.imageSmoothingQuality='high';
+  ctx.drawImage(im.img, view.ox, view.oy, im.w*view.scale, im.h*view.scale);
+  // committed polygons
+  curPolys().forEach(p=>drawPoly(p.pts, COLORS[p.cls], true, CLASSES[p.cls]));
+  // in-progress
+  if(drawingPts && drawingPts.length){ drawPoly(drawingPts, COLORS[active], false); }
+}
+function drawPoly(pts, color, closed, label){
+  if(pts.length<1) return;
+  ctx.lineWidth=2*DPR; ctx.strokeStyle=color;
+  ctx.fillStyle=color+'33';
+  ctx.beginPath();
+  pts.forEach(([x,y],k)=>{ const [sx,sy]=i2s(x,y); k?ctx.lineTo(sx,sy):ctx.moveTo(sx,sy); });
+  if(closed){ ctx.closePath(); ctx.fill(); }
+  ctx.stroke();
+  if(closed && label){
+    const [lx,ly]=i2s(pts[0][0],pts[0][1]);
+    ctx.fillStyle=color; ctx.font=`${13*DPR}px sans-serif`;
+    ctx.fillText(label, lx+4, ly-4);
+  }
+}
+
+// ---------- pointer handling: PEN draws, TOUCH pans/zooms ----------
+const pts=new Map(); // active touch pointers
+let panLast=null, pinchBase=null;
+cv.addEventListener('pointerdown', e=>{
+  cv.setPointerCapture(e.pointerId);
+  if(e.pointerType==='pen' || e.pointerType==='mouse'){
+    drawingPts=[]; pushPenPoint(e); render();
+  } else if(e.pointerType==='touch'){
+    pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(pts.size===1){ panLast={x:e.clientX,y:e.clientY}; }
+    else if(pts.size===2){ pinchBase=pinchState(); panLast=null; }
+  }
+});
+cv.addEventListener('pointermove', e=>{
+  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawingPts){
+    pushPenPoint(e); render();
+  } else if(e.pointerType==='touch' && pts.has(e.pointerId)){
+    pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if(pts.size===2 && pinchBase){
+      const ps=pinchState();
+      zoomAtCss(ps.mx,ps.my, ps.dist/pinchBase.dist);
+      // pan with the midpoint movement too
+      view.ox += (ps.mx-pinchBase.mx)*DPR; view.oy += (ps.my-pinchBase.my)*DPR;
+      pinchBase=ps; render();
+    } else if(pts.size===1 && panLast){
+      view.ox += (e.clientX-panLast.x)*DPR; view.oy += (e.clientY-panLast.y)*DPR;
+      panLast={x:e.clientX,y:e.clientY}; render();
+    }
+  }
+});
+function endPtr(e){
+  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawingPts){
+    if(drawingPts.length>=3){ curPolys().push({cls:active, pts:drawingPts}); save(); }
+    drawingPts=null; render(); status();
+  } else if(e.pointerType==='touch'){
+    pts.delete(e.pointerId);
+    if(pts.size<2) pinchBase=null;
+    if(pts.size===1){ const p=[...pts.values()][0]; panLast={x:p.x,y:p.y}; } else panLast=null;
+  }
+}
+cv.addEventListener('pointerup', endPtr);
+cv.addEventListener('pointercancel', endPtr);
+cv.addEventListener('pointerleave', e=>{ if(e.pointerType==='mouse'&&drawingPts) endPtr(e); });
+
+function pushPenPoint(e){
+  const r=cv.getBoundingClientRect();
+  const [ix,iy]=s2i(e.clientX-r.left, e.clientY-r.top);
+  const last=drawingPts[drawingPts.length-1];
+  if(!last || Math.hypot(ix-last[0],iy-last[1])>=SIMPLIFY_PX){ drawingPts.push([ix,iy]); }
+}
+function pinchState(){
+  const a=[...pts.values()];
+  const dist=Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y);
+  return {dist, mx:(a[0].x+a[1].x)/2, my:(a[0].y+a[1].y)/2};
+}
+function zoomAtCss(cssx,cssy,factor){
+  const r=cv.getBoundingClientRect();
+  zoomAt((cssx-r.left)*DPR,(cssy-r.top)*DPR,factor);
+}
+
+// ---------- controls ----------
+document.getElementById('prev').onclick=()=>{ if(cur>0){cur--;fit();status();} };
+document.getElementById('next').onclick=()=>{ if(cur<images.length-1){cur++;fit();status();} };
+document.getElementById('zin').onclick=()=>zoomAt(cv.width/2,cv.height/2,1.25);
+document.getElementById('zout').onclick=()=>zoomAt(cv.width/2,cv.height/2,0.8);
+document.getElementById('fit').onclick=fit;
+document.getElementById('undo').onclick=()=>{ curPolys().pop(); save(); render(); status(); };
+document.getElementById('del').onclick=()=>{ curPolys().pop(); save(); render(); status(); };
+document.getElementById('clear').onclick=()=>{ if(confirm('Clear all polygons on this image?')){ labels[curName()]=[]; save(); render(); status(); } };
+
+// YOLO-seg: "<cls> x1 y1 x2 y2 ..." normalized 0..1
+function yoloFor(name){
+  const im=images.find(x=>x.name===name); if(!im) return '';
+  return (labels[name]||[]).map(p=>{
+    const flat=p.pts.map(([x,y])=>`${(x/im.w).toFixed(6)} ${(y/im.h).toFixed(6)}`).join(' ');
+    return `${p.cls} ${flat}`;
+  }).join('\n');
+}
+function dl(filename, text){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'}));
+  a.download=filename; a.click();
+}
+document.getElementById('export').onclick=()=>{
+  const n=curName(); if(!n){alert('No image');return;}
+  const base=n.replace(/\.[^.]+$/,'');
+  dl(base+'.txt', yoloFor(n));
+};
+document.getElementById('exportAll').onclick=()=>{
+  const out={classes:CLASSES, labels:{}};
+  images.forEach(im=>{ out.labels[im.name]={w:im.w,h:im.h, yolo:yoloFor(im.name)}; });
+  dl('apex_labels_all.json', JSON.stringify(out,null,2));
+};
+
+// ---------- persistence (so a refresh/lock doesn't lose work) ----------
+function save(){ try{ localStorage.setItem('apex_poly_labels', JSON.stringify(labels)); }catch(e){} }
+(function load(){ try{ const s=localStorage.getItem('apex_poly_labels'); if(s) labels=JSON.parse(s); }catch(e){} })();
+
+function status(){
+  const n=curName();
+  const total=Object.values(labels).reduce((a,b)=>a+(b?b.length:0),0);
+  document.getElementById('imgname').textContent = n? `${cur+1}/${images.length}  ${n}` : 'no image';
+  document.getElementById('status').textContent =
+    n ? `Active class: ${CLASSES[active]}  •  this image: ${curPolys().length} polys  •  saved total: ${total}`
+      : 'Load a batch of images to start.';
+}
+resize(); status();
+</script>
+</body>
+</html>
