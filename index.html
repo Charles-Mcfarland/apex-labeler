@@ -50,6 +50,9 @@
   <button class="btn" id="clear">Clear img</button>
   <button class="btn go" id="export">⬇︎ Export .txt</button>
   <button class="btn" id="exportAll">⬇︎ All (JSON)</button>
+  <button class="btn" id="savebtn">💾 Save</button>
+  <span id="saved" style="opacity:.45;font-size:12px;color:var(--accent);align-self:center">Saved ✓</span>
+  <button class="btn warn" id="reset">🗑 New session</button>
 </div>
 <div id="wrap"><canvas id="cv"></canvas></div>
 <div id="status">Load a batch of images to start.</div>
@@ -67,6 +70,7 @@ let images=[];          // {name, img, w, h}
 let cur=-1;
 let labels={};          // name -> [{cls, pts:[[x,y],...] in IMAGE pixels}]
 let active=0;
+let ordSeq=0;           // monotonic load-order counter so restored images keep their order
 let view={scale:1, ox:0, oy:0};
 let drawStrokes=null;   // in-progress polygon = array of pen strokes; lift the pen between strokes, ✓ Finish to close
 const SIMPLIFY_PX = 3;  // min pixel spacing between captured points (image space)
@@ -95,15 +99,24 @@ function resize(){
 window.addEventListener('resize', resize);
 
 // ---------- load ----------
-document.getElementById('file').addEventListener('change', e=>{
+document.getElementById('file').addEventListener('change', async e=>{
   const files=[...e.target.files].filter(f=>f.type.startsWith('image/'));
-  let loaded=0;
-  files.forEach(f=>{
-    const img=new Image();
-    img.onload=()=>{ images.push({name:f.name, img, w:img.naturalWidth, h:img.naturalHeight});
-      loaded++; if(loaded===files.length){ if(cur<0){cur=0; fit();} status(); } };
-    img.src=URL.createObjectURL(f);
-  });
+  for(const f of files){
+    await new Promise(r=>{
+      const img=new Image();
+      img.onload=async ()=>{
+        if(!images.some(x=>x.name===f.name)) images.push({name:f.name, img, w:img.naturalWidth, h:img.naturalHeight});
+        if(db){ try{ await idbPut({name:f.name, blob:f, w:img.naturalWidth, h:img.naturalHeight, ord:ordSeq++});
+                      localStorage.setItem('apex_ord', ordSeq); }
+                catch(err){ savedFlash('⚠️ storage full — export now'); } }
+        r();
+      };
+      img.onerror=()=>r();
+      img.src=URL.createObjectURL(f);
+    });
+  }
+  if(cur<0 && images.length){ cur=0; fit(); }
+  saveCur(); status(); savedFlash('Saved ✓');
 });
 
 function curName(){ return cur>=0 ? images[cur].name : null; }
@@ -233,8 +246,8 @@ function undoStroke(){
   } else { curPolys().pop(); save(); }               // not drawing: drop the last finished polygon
   render(); status();
 }
-document.getElementById('prev').onclick=()=>{ if(cur>0){drawStrokes=null;cur--;fit();status();} };
-document.getElementById('next').onclick=()=>{ if(cur<images.length-1){drawStrokes=null;cur++;fit();status();} };
+document.getElementById('prev').onclick=()=>{ if(cur>0){drawStrokes=null;cur--;fit();saveCur();status();} };
+document.getElementById('next').onclick=()=>{ if(cur<images.length-1){drawStrokes=null;cur++;fit();saveCur();status();} };
 document.getElementById('zin').onclick=()=>zoomAt(cv.width/2,cv.height/2,1.25);
 document.getElementById('zout').onclick=()=>zoomAt(cv.width/2,cv.height/2,0.8);
 document.getElementById('fit').onclick=fit;
@@ -242,6 +255,14 @@ document.getElementById('finish').onclick=finishPoly;
 document.getElementById('undo').onclick=undoStroke;
 document.getElementById('delpoly').onclick=()=>{ curPolys().pop(); save(); render(); status(); };
 document.getElementById('clear').onclick=()=>{ if(confirm('Clear all polygons on this image?')){ labels[curName()]=[]; save(); render(); status(); } };
+document.getElementById('savebtn').onclick=()=>{ save(); saveCur(); };
+document.getElementById('reset').onclick=async ()=>{
+  if(!confirm('Start a NEW session? This removes the loaded images + labels from THIS device. Export first if you want a backup.')) return;
+  if(db){ try{ await idbClear(); }catch(e){} }
+  localStorage.removeItem('apex_poly_labels'); localStorage.removeItem('apex_cur'); localStorage.removeItem('apex_ord');
+  images=[]; labels={}; cur=-1; drawStrokes=null; ordSeq=0;
+  render(); status(); savedFlash('Cleared');
+};
 
 // YOLO-seg: "<cls> x1 y1 x2 y2 ..." normalized 0..1
 function yoloFor(name){
@@ -267,9 +288,23 @@ document.getElementById('exportAll').onclick=()=>{
   dl('apex_labels_all.json', JSON.stringify(out,null,2));
 };
 
-// ---------- persistence (so a refresh/lock doesn't lose work) ----------
-function save(){ try{ localStorage.setItem('apex_poly_labels', JSON.stringify(labels)); }catch(e){} }
-(function load(){ try{ const s=localStorage.getItem('apex_poly_labels'); if(s) labels=JSON.parse(s); }catch(e){} })();
+// ---------- persistence: labels in localStorage, IMAGES in IndexedDB (survive refresh/lock/close) ----------
+let db=null;
+function openDB(){ return new Promise((res,rej)=>{ const r=indexedDB.open('apex_labeler',1);
+  r.onupgradeneeded=()=>{ r.result.createObjectStore('images',{keyPath:'name'}); };
+  r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
+function idbPut(rec){ return new Promise((res,rej)=>{ const tx=db.transaction('images','readwrite');
+  tx.objectStore('images').put(rec); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
+function idbAll(){ return new Promise((res,rej)=>{ const tx=db.transaction('images','readonly');
+  const rq=tx.objectStore('images').getAll(); rq.onsuccess=()=>res(rq.result||[]); rq.onerror=()=>rej(rq.error); }); }
+function idbClear(){ return new Promise(res=>{ const tx=db.transaction('images','readwrite');
+  tx.objectStore('images').clear(); tx.oncomplete=()=>res(); tx.onerror=()=>res(); }); }
+function save(){ try{ localStorage.setItem('apex_poly_labels', JSON.stringify(labels)); savedFlash('Saved ✓'); }catch(e){ savedFlash('⚠️ save failed'); } }
+function saveCur(){ try{ localStorage.setItem('apex_cur', cur); }catch(e){} }
+let _flashT=null;
+function savedFlash(msg){ const el=document.getElementById('saved'); if(!el) return;
+  el.textContent=msg||'Saved ✓'; el.style.opacity='1';
+  clearTimeout(_flashT); _flashT=setTimeout(()=>{ el.style.opacity='.45'; el.textContent='Saved ✓'; }, 1500); }
 
 function status(){
   const n=curName();
@@ -280,7 +315,31 @@ function status(){
     n ? `Active class: ${CLASSES[active]}  •  this image: ${curPolys().length} polys  •  saved total: ${total}${drawing}`
       : 'Load a batch of images to start.';
 }
-resize(); status();
+// ---------- boot: restore labels + images, then go ----------
+async function boot(){
+  try{ const s=localStorage.getItem('apex_poly_labels'); if(s) labels=JSON.parse(s); }catch(e){}
+  ordSeq = +localStorage.getItem('apex_ord') || 0;
+  try{ db=await openDB(); }catch(e){ db=null; }
+  if(db){
+    try{
+      const recs=await idbAll(); recs.sort((a,b)=>(a.ord||0)-(b.ord||0));
+      for(const rec of recs){
+        await new Promise(r=>{
+          const img=new Image();
+          img.onload=()=>{ images.push({name:rec.name, img, w:rec.w||img.naturalWidth, h:rec.h||img.naturalHeight}); r(); };
+          img.onerror=()=>r();
+          img.src=URL.createObjectURL(rec.blob);
+        });
+      }
+    }catch(e){}
+  }
+  if(images.length){ cur=Math.min(+localStorage.getItem('apex_cur')||0, images.length-1); }
+  resize();
+  if(cur>=0) fit();
+  status();
+  if(images.length) savedFlash('Restored ✓');
+}
+boot();
 </script>
 </body>
 </html>
