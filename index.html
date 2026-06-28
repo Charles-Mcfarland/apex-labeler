@@ -33,6 +33,7 @@
 <body>
 <div id="bar">
   <label class="load btn go">⬆︎ Load images<input id="file" type="file" accept="image/*" multiple></label>
+  <label class="load btn">⬆︎ Import<input id="importf" type="file" accept=".json,.txt" multiple></label>
   <span id="nav" style="display:flex;gap:4px;align-items:center">
     <button class="btn" id="prev">◀</button>
     <span id="imgname" style="min-width:120px;text-align:center;font-size:12px">no image</span>
@@ -44,8 +45,10 @@
     <button class="btn" id="zout">－</button>
     <button class="btn" id="fit">Fit</button>
   </span>
+  <button class="btn go" id="mode">✏️ Draw</button>
   <button class="btn go" id="finish">✓ Finish</button>
   <button class="btn" id="undo">↶ Undo stroke</button>
+  <button class="btn" id="simplify">⌁ Simplify</button>
   <button class="btn warn" id="delpoly">Del last poly</button>
   <button class="btn" id="clear">Clear img</button>
   <button class="btn go" id="export">⬇︎ Export .txt</button>
@@ -76,13 +79,20 @@ let drawStrokes=null;   // in-progress polygon = array of pen strokes; lift the 
 let penDown=false;      // true only while the tip is touching glass (ignores Apple Pencil hover)
 const SIMPLIFY_PX = 3;  // min pixel spacing between captured points (image space)
 function curDrawPts(){ return drawStrokes ? drawStrokes.flat() : []; }
+// ---- edit mode (correct model proposals / fix any polygon) ----
+let mode='draw';        // 'draw' | 'edit'
+let sel=null;           // index into curPolys() of selected polygon
+let dragV=null;         // {pi,vi} vertex currently being dragged
+let dragMoved=false, dragStart=null;
+let lastTap={t:0,pi:-1,vi:-1};  // for double-tap-to-delete-vertex
 
 // ---------- palette ----------
 const pal=document.getElementById('palette');
 CLASSES.forEach((c,i)=>{
   const b=document.createElement('div'); b.className='cls'; b.textContent=c;
   b.style.background=COLORS[i]; b.dataset.i=i;
-  b.onclick=()=>{ active=i; refreshPalette(); status(); };
+  b.onclick=()=>{ if(mode==='edit' && sel!=null && curPolys()[sel]){ curPolys()[sel].cls=i; save(); }
+    active=i; refreshPalette(); render(); status(); };
   pal.appendChild(b);
 });
 function refreshPalette(){ [...pal.children].forEach((b,i)=>b.classList.toggle('active', i===active)); }
@@ -146,15 +156,17 @@ function render(){
   const im=images[cur];
   ctx.imageSmoothingQuality='high';
   ctx.drawImage(im.img, view.ox, view.oy, im.w*view.scale, im.h*view.scale);
-  // committed polygons
-  curPolys().forEach(p=>drawPoly(p.pts, COLORS[p.cls], true, CLASSES[p.cls]));
+  // committed polygons (highlight the selected one in edit mode)
+  curPolys().forEach((p,i)=>drawPoly(p.pts, COLORS[p.cls], true, CLASSES[p.cls], mode==='edit'&&i===sel));
+  // edit-mode vertex handles on the selected polygon
+  if(mode==='edit' && sel!=null && curPolys()[sel]) drawHandles(curPolys()[sel].pts);
   // in-progress (multi-stroke; stays open until you tap ✓ Finish)
   if(drawStrokes){ const fp=curDrawPts(); if(fp.length){ drawPoly(fp, COLORS[active], false); drawStartDot(fp[0]); } }
 }
-function drawPoly(pts, color, closed, label){
+function drawPoly(pts, color, closed, label, selected){
   if(pts.length<1) return;
-  ctx.lineWidth=2*DPR; ctx.strokeStyle=color;
-  ctx.fillStyle=color+'33';
+  ctx.lineWidth=(selected?4:2)*DPR; ctx.strokeStyle=selected?'#fff':color;
+  ctx.fillStyle=color+(selected?'55':'33');
   ctx.beginPath();
   pts.forEach(([x,y],k)=>{ const [sx,sy]=i2s(x,y); k?ctx.lineTo(sx,sy):ctx.moveTo(sx,sy); });
   if(closed){ ctx.closePath(); ctx.fill(); }
@@ -171,6 +183,12 @@ function drawStartDot(pt){ // white anchor at the start point so you can see whe
   ctx.fillStyle='#fff'; ctx.fill();
   ctx.lineWidth=2*DPR; ctx.strokeStyle='#000'; ctx.stroke();
 }
+function drawHandles(pts){ // draggable vertex dots on the selected polygon (edit mode)
+  pts.forEach(([x,y])=>{ const [sx,sy]=i2s(x,y);
+    ctx.beginPath(); ctx.arc(sx,sy,7*DPR,0,Math.PI*2);
+    ctx.fillStyle='#fff'; ctx.fill();
+    ctx.lineWidth=2*DPR; ctx.strokeStyle='#000'; ctx.stroke(); });
+}
 
 // ---------- pointer handling: PEN draws, TOUCH pans/zooms ----------
 const pts=new Map(); // active touch pointers
@@ -179,6 +197,7 @@ cv.addEventListener('pointerdown', e=>{
   cv.setPointerCapture(e.pointerId);
   if(e.pointerType==='pen' || e.pointerType==='mouse'){
     penDown=true;
+    if(mode==='edit'){ editDown(e); return; }
     if(!drawStrokes) drawStrokes=[];   // start a new polygon only if none is in progress
     drawStrokes.push([]);              // begin a fresh stroke
     pushPenPoint(e); render(); status();
@@ -189,8 +208,9 @@ cv.addEventListener('pointerdown', e=>{
   }
 });
 cv.addEventListener('pointermove', e=>{
-  if((e.pointerType==='pen'||e.pointerType==='mouse') && drawStrokes && penDown){
-    pushPenPoint(e); render();
+  if((e.pointerType==='pen'||e.pointerType==='mouse') && penDown){
+    if(mode==='edit'){ editMove(e); return; }
+    if(drawStrokes){ pushPenPoint(e); render(); }
   } else if(e.pointerType==='touch' && pts.has(e.pointerId)){
     pts.set(e.pointerId,{x:e.clientX,y:e.clientY});
     if(pts.size===2 && pinchBase){
@@ -207,6 +227,7 @@ cv.addEventListener('pointermove', e=>{
 });
 function endPtr(e){
   if(e.pointerType==='pen'||e.pointerType==='mouse'){
+    if(mode==='edit'){ editUp(e); penDown=false; return; }
     penDown=false;        // tip left the glass; stop capturing (hover is ignored)
     if(drawStrokes){ render(); status(); }  // polygon stays OPEN — lift, zoom in, keep tracing, then tap ✓ Finish
   } else if(e.pointerType==='touch'){
@@ -217,7 +238,86 @@ function endPtr(e){
 }
 cv.addEventListener('pointerup', endPtr);
 cv.addEventListener('pointercancel', endPtr);
-cv.addEventListener('pointerleave', e=>{ if(e.pointerType==='mouse'&&drawingPts) endPtr(e); });
+cv.addEventListener('pointerleave', e=>{ if(e.pointerType==='mouse'&&(drawStrokes||dragV)) endPtr(e); });
+
+// ---------- EDIT MODE: select / drag / add / delete vertices, relabel ----------
+function evImg(e){ const r=cv.getBoundingClientRect(); return s2i(e.clientX-r.left, e.clientY-r.top); }
+function evScr(e){ const r=cv.getBoundingClientRect(); return [(e.clientX-r.left)*DPR,(e.clientY-r.top)*DPR]; }
+function editDown(e){
+  const [sx,sy]=evScr(e); dragMoved=false; dragStart={sx,sy};
+  const hv=hitVertex(sx,sy);                              // 1) grab a vertex (selects its polygon)
+  if(hv){ sel=hv.pi; dragV=hv; render(); status(); return; }
+  const he=hitEdge(sx,sy);                                // 2) tap the outline of selected -> insert + grab
+  if(he){ curPolys()[sel].pts.splice(he.vi+1,0,[he.x,he.y]); dragV={pi:sel,vi:he.vi+1}; dragMoved=true; render(); status(); return; }
+  const [ix,iy]=evImg(e); const pi=polyAt(ix,iy);         // 3) tap a shape body -> select it
+  if(pi!=null){ sel=pi; dragV=null; render(); status(); return; }
+  sel=null; dragV=null; render(); status();               // 4) tap empty -> deselect
+}
+function editMove(e){
+  if(!dragV) return;
+  const [sx,sy]=evScr(e);
+  if(dragStart && Math.hypot(sx-dragStart.sx,sy-dragStart.sy)>3*DPR) dragMoved=true;
+  const [ix,iy]=evImg(e); const p=curPolys()[dragV.pi]; if(!p) return;
+  p.pts[dragV.vi]=[ix,iy]; render();
+}
+function editUp(e){
+  if(dragV){
+    if(!dragMoved){                                        // a tap (not a drag) on a vertex
+      const now=Date.now();
+      if(now-lastTap.t<350 && lastTap.pi===dragV.pi && lastTap.vi===dragV.vi){
+        const p=curPolys()[dragV.pi];
+        if(p && p.pts.length>3){ p.pts.splice(dragV.vi,1); save(); }   // double-tap -> delete vertex
+        lastTap={t:0,pi:-1,vi:-1};
+      } else lastTap={t:now, pi:dragV.pi, vi:dragV.vi};
+    } else save();                                         // vertex was moved
+  }
+  dragV=null; render(); status();
+}
+function hitVertex(sx,sy){
+  const R=15*DPR, order=[]; if(sel!=null) order.push(sel);
+  curPolys().forEach((_,i)=>{ if(i!==sel) order.push(i); });
+  for(const pi of order){ const p=curPolys()[pi];
+    for(let vi=0;vi<p.pts.length;vi++){ const [vx,vy]=i2s(p.pts[vi][0],p.pts[vi][1]);
+      if(Math.hypot(vx-sx,vy-sy)<=R) return {pi,vi}; } }
+  return null;
+}
+function hitEdge(sx,sy){
+  if(sel==null) return null; const p=curPolys()[sel]; if(!p||p.pts.length<2) return null;
+  const R=12*DPR; let best=null;
+  for(let vi=0;vi<p.pts.length;vi++){
+    const a=i2s(p.pts[vi][0],p.pts[vi][1]); const j=(vi+1)%p.pts.length; const b=i2s(p.pts[j][0],p.pts[j][1]);
+    const pr=projSeg(sx,sy,a[0],a[1],b[0],b[1]);
+    if(pr.d<=R && (!best||pr.d<best.d)) best={vi,d:pr.d,t:pr.t};
+  }
+  if(!best) return null;
+  const p1=p.pts[best.vi], p2=p.pts[(best.vi+1)%p.pts.length];
+  return {vi:best.vi, x:p1[0]+(p2[0]-p1[0])*best.t, y:p1[1]+(p2[1]-p1[1])*best.t};
+}
+function projSeg(px,py,ax,ay,bx,by){
+  const dx=bx-ax,dy=by-ay,L2=dx*dx+dy*dy||1;
+  let t=((px-ax)*dx+(py-ay)*dy)/L2; t=Math.max(0,Math.min(1,t));
+  return {d:Math.hypot(px-(ax+t*dx),py-(ay+t*dy)), t};
+}
+function polyAt(ix,iy){ const ps=curPolys();
+  for(let i=ps.length-1;i>=0;i--){ if(pointInPoly(ix,iy,ps[i].pts)) return i; } return null; }
+function pointInPoly(x,y,pts){ let inside=false;
+  for(let i=0,j=pts.length-1;i<pts.length;j=i++){
+    const xi=pts[i][0],yi=pts[i][1],xj=pts[j][0],yj=pts[j][1];
+    if(((yi>y)!==(yj>y)) && (x<(xj-xi)*(y-yi)/((yj-yi)||1e-9)+xi)) inside=!inside; }
+  return inside; }
+// ---------- polygon simplification (Ramer–Douglas–Peucker) — thins dense model masks ----------
+function ptLineDist(p,a,b){ const dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy)||1;
+  return Math.abs((p[0]-a[0])*dy-(p[1]-a[1])*dx)/L; }
+function rdp(pts,eps){
+  if(pts.length<3) return pts.slice();
+  const keep=new Array(pts.length).fill(false); keep[0]=keep[pts.length-1]=true;
+  const stack=[[0,pts.length-1]];
+  while(stack.length){ const [s,e]=stack.pop(); let dmax=0,idx=-1;
+    for(let i=s+1;i<e;i++){ const d=ptLineDist(pts[i],pts[s],pts[e]); if(d>dmax){dmax=d;idx=i;} }
+    if(dmax>eps && idx>0){ keep[idx]=true; stack.push([s,idx],[idx,e]); } }
+  return pts.filter((_,i)=>keep[i]);
+}
+function simplifyPoly(pts,eps){ let out=rdp(pts,eps); return out.length>=3?out:pts.slice(); }
 
 function pushPenPoint(e){
   const r=cv.getBoundingClientRect();
@@ -249,8 +349,8 @@ function undoStroke(){
   } else { curPolys().pop(); save(); }               // not drawing: drop the last finished polygon
   render(); status();
 }
-document.getElementById('prev').onclick=()=>{ if(cur>0){drawStrokes=null;cur--;fit();saveCur();status();} };
-document.getElementById('next').onclick=()=>{ if(cur<images.length-1){drawStrokes=null;cur++;fit();saveCur();status();} };
+document.getElementById('prev').onclick=()=>{ if(cur>0){drawStrokes=null;sel=null;cur--;fit();saveCur();status();} };
+document.getElementById('next').onclick=()=>{ if(cur<images.length-1){drawStrokes=null;sel=null;cur++;fit();saveCur();status();} };
 document.getElementById('zin').onclick=()=>zoomAt(cv.width/2,cv.height/2,1.25);
 document.getElementById('zout').onclick=()=>zoomAt(cv.width/2,cv.height/2,0.8);
 document.getElementById('fit').onclick=fit;
@@ -263,9 +363,63 @@ document.getElementById('reset').onclick=async ()=>{
   if(!confirm('Start a NEW session? This removes the loaded images + labels from THIS device. Export first if you want a backup.')) return;
   if(db){ try{ await idbClear(); }catch(e){} }
   localStorage.removeItem('apex_poly_labels'); localStorage.removeItem('apex_cur'); localStorage.removeItem('apex_ord');
-  images=[]; labels={}; cur=-1; drawStrokes=null; ordSeq=0;
+  images=[]; labels={}; cur=-1; drawStrokes=null; sel=null; ordSeq=0;
   render(); status(); savedFlash('Cleared');
 };
+// ---- mode toggle + simplify ----
+function setMode(m){ mode=m; drawStrokes=null; if(m!=='edit') sel=null;
+  const b=document.getElementById('mode');
+  b.textContent = m==='edit' ? '✋ Edit' : '✏️ Draw';
+  b.classList.toggle('go', m==='draw'); b.classList.toggle('warn', m==='edit');
+  render(); status(); updateHint(); }
+document.getElementById('mode').onclick=()=> setMode(mode==='edit'?'draw':'edit');
+document.getElementById('simplify').onclick=()=>{
+  if(mode!=='edit' || sel==null || cur<0) { savedFlash('Edit mode: select a shape first'); return; }
+  const p=curPolys()[sel], im=images[cur];
+  p.pts=simplifyPoly(p.pts, 0.006*Math.hypot(im.w,im.h)); save(); render(); status();
+};
+function updateHint(){ document.getElementById('hint').innerHTML = mode==='edit'
+  ? '✋ tap a shape to select &nbsp;•&nbsp; drag a dot to move &nbsp;•&nbsp; double-tap a dot to delete &nbsp;•&nbsp; tap the outline to add &nbsp;•&nbsp; tap a class to relabel'
+  : '✏️ Trace in pieces — lift anytime &nbsp;•&nbsp; ✓ Finish to close &nbsp;•&nbsp; ✌️ pinch-zoom &nbsp;•&nbsp; ☝️ pan'; }
+// ---- import model proposals (or saved labels): All-JSON or a single YOLO .txt ----
+function parseYolo(text, w, h, classMap){
+  const polys=[];
+  (text||'').split(/\r?\n/).forEach(line=>{
+    const t=line.trim().split(/\s+/).filter(Boolean); if(t.length<7) return;
+    let cls=parseInt(t[0],10); if(classMap && classMap[cls]!=null) cls=classMap[cls];
+    const nums=t.slice(1).map(Number), pts=[];
+    for(let i=0;i+1<nums.length;i+=2) pts.push([nums[i]*w, nums[i+1]*h]);
+    if(pts.length>=3 && cls>=0 && cls<CLASSES.length) polys.push({cls,pts});
+  });
+  return polys;
+}
+function importJSON(obj){
+  let classMap=null;
+  if(Array.isArray(obj.classes)){ classMap={}; obj.classes.forEach((nm,i)=>{ const k=CLASSES.indexOf(nm); classMap[i]=k>=0?k:i; }); }
+  let added=0, hit=0; const ents=obj.labels||{};
+  Object.keys(ents).forEach(name=>{
+    const en=ents[name], im=images.find(x=>x.name===name);
+    const w=(en&&en.w)||(im&&im.w), h=(en&&en.h)||(im&&im.h); if(!w||!h) return;
+    const yolo = typeof en==='string'? en : (en.yolo||'');
+    const eps=0.004*Math.hypot(w,h);
+    const polys=parseYolo(yolo,w,h,classMap).map(p=>({cls:p.cls, pts:simplifyPoly(p.pts,eps)}));
+    if(polys.length){ (labels[name]||(labels[name]=[])).push(...polys); added+=polys.length; hit++; }
+  });
+  return {added,hit};
+}
+document.getElementById('importf').addEventListener('change', async e=>{
+  const files=[...e.target.files]; let tot=0, hit=0;
+  for(const f of files){
+    try{
+      const text=await f.text();
+      if(f.name.toLowerCase().endsWith('.json')){ const r=importJSON(JSON.parse(text)); tot+=r.added; hit+=r.hit; }
+      else if(cur>=0){ const im=images[cur]; const eps=0.004*Math.hypot(im.w,im.h);
+        const polys=parseYolo(text,im.w,im.h,null).map(p=>({cls:p.cls,pts:simplifyPoly(p.pts,eps)}));
+        if(polys.length){ curPolys().push(...polys); tot+=polys.length; hit++; } }
+    }catch(err){ alert('Import failed for '+f.name+': '+err.message); }
+  }
+  save(); render(); status(); savedFlash(`Imported ${tot} polys / ${hit} imgs`); e.target.value='';
+});
 
 // YOLO-seg: "<cls> x1 y1 x2 y2 ..." normalized 0..1
 function yoloFor(name){
@@ -314,8 +468,11 @@ function status(){
   const total=Object.values(labels).reduce((a,b)=>a+(b?b.length:0),0);
   document.getElementById('imgname').textContent = n? `${cur+1}/${images.length}  ${n}` : 'no image';
   const drawing = drawStrokes ? `  •  ✏️ drawing ${CLASSES[active]} (${drawStrokes.length} strokes) — tap ✓ Finish` : '';
+  const editing = mode==='edit'
+    ? (sel!=null && curPolys()[sel] ? `  •  ✋ editing ${CLASSES[curPolys()[sel].cls]} (${curPolys()[sel].pts.length} pts)` : '  •  ✋ EDIT: tap a shape')
+    : '';
   document.getElementById('status').textContent =
-    n ? `Active class: ${CLASSES[active]}  •  this image: ${curPolys().length} polys  •  saved total: ${total}${drawing}`
+    n ? `Active class: ${CLASSES[active]}  •  this image: ${curPolys().length} polys  •  saved total: ${total}${drawing}${editing}`
       : 'Load a batch of images to start.';
 }
 // ---------- boot: restore labels + images, then go ----------
@@ -339,7 +496,7 @@ async function boot(){
   if(images.length){ cur=Math.min(+localStorage.getItem('apex_cur')||0, images.length-1); }
   resize();
   if(cur>=0) fit();
-  status();
+  status(); updateHint();
   if(images.length) savedFlash('Restored ✓');
 }
 boot();
