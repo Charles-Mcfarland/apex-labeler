@@ -361,7 +361,7 @@ document.getElementById('clear').onclick=()=>{ if(confirm('Clear all polygons on
 document.getElementById('savebtn').onclick=()=>{ save(); saveCur(); };
 document.getElementById('reset').onclick=async ()=>{
   if(!confirm('Start a NEW session? This removes the loaded images + labels from THIS device. Export first if you want a backup.')) return;
-  if(db){ try{ await idbClear(); }catch(e){} }
+  if(db){ try{ await idbClear(); await idbPutMeta('labels',{}); }catch(e){} }
   localStorage.removeItem('apex_poly_labels'); localStorage.removeItem('apex_cur'); localStorage.removeItem('apex_ord');
   images=[]; labels={}; cur=-1; drawStrokes=null; sel=null; ordSeq=0;
   render(); status(); savedFlash('Cleared');
@@ -401,9 +401,9 @@ function importJSON(obj){
     const en=ents[name], im=images.find(x=>x.name===name);
     const w=(en&&en.w)||(im&&im.w), h=(en&&en.h)||(im&&im.h); if(!w||!h) return;
     const yolo = typeof en==='string'? en : (en.yolo||'');
-    const eps=0.004*Math.hypot(w,h);
-    const polys=parseYolo(yolo,w,h,classMap).map(p=>({cls:p.cls, pts:simplifyPoly(p.pts,eps)}));
-    if(polys.length){ (labels[name]||(labels[name]=[])).push(...polys); added+=polys.length; hit++; }
+    const polys=parseYolo(yolo,w,h,classMap);   // faithful — no simplify (model proposals come pre-thinned from the box)
+    labels[name]=polys;                          // replace = snapshot/restore semantics
+    added+=polys.length; if(polys.length) hit++;
   });
   return {added,hit};
 }
@@ -413,19 +413,20 @@ document.getElementById('importf').addEventListener('change', async e=>{
     try{
       const text=await f.text();
       if(f.name.toLowerCase().endsWith('.json')){ const r=importJSON(JSON.parse(text)); tot+=r.added; hit+=r.hit; }
-      else if(cur>=0){ const im=images[cur]; const eps=0.004*Math.hypot(im.w,im.h);
-        const polys=parseYolo(text,im.w,im.h,null).map(p=>({cls:p.cls,pts:simplifyPoly(p.pts,eps)}));
-        if(polys.length){ curPolys().push(...polys); tot+=polys.length; hit++; } }
+      else if(cur>=0){ const im=images[cur];
+        const polys=parseYolo(text,im.w,im.h,null);
+        labels[im.name]=polys; tot+=polys.length; if(polys.length) hit++; }
     }catch(err){ alert('Import failed for '+f.name+': '+err.message); }
   }
   save(); render(); status(); savedFlash(`Imported ${tot} polys / ${hit} imgs`); e.target.value='';
 });
 
 // YOLO-seg: "<cls> x1 y1 x2 y2 ..." normalized 0..1
+function clamp01(v){ return v<0?0:(v>1?1:v); }
 function yoloFor(name){
   const im=images.find(x=>x.name===name); if(!im) return '';
   return (labels[name]||[]).map(p=>{
-    const flat=p.pts.map(([x,y])=>`${(x/im.w).toFixed(6)} ${(y/im.h).toFixed(6)}`).join(' ');
+    const flat=p.pts.map(([x,y])=>`${clamp01(x/im.w).toFixed(6)} ${clamp01(y/im.h).toFixed(6)}`).join(' ');
     return `${p.cls} ${flat}`;
   }).join('\n');
 }
@@ -447,16 +448,26 @@ document.getElementById('exportAll').onclick=()=>{
 
 // ---------- persistence: labels in localStorage, IMAGES in IndexedDB (survive refresh/lock/close) ----------
 let db=null;
-function openDB(){ return new Promise((res,rej)=>{ const r=indexedDB.open('apex_labeler',1);
-  r.onupgradeneeded=()=>{ r.result.createObjectStore('images',{keyPath:'name'}); };
+function openDB(){ return new Promise((res,rej)=>{ const r=indexedDB.open('apex_labeler',2);
+  r.onupgradeneeded=()=>{ const d=r.result;
+    if(!d.objectStoreNames.contains('images')) d.createObjectStore('images',{keyPath:'name'});
+    if(!d.objectStoreNames.contains('meta')) d.createObjectStore('meta'); };
   r.onsuccess=()=>res(r.result); r.onerror=()=>rej(r.error); }); }
+function idbPutMeta(k,v){ return new Promise((res,rej)=>{ const tx=db.transaction('meta','readwrite');
+  tx.objectStore('meta').put(v,k); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
+function idbGetMeta(k){ return new Promise(res=>{ try{ const tx=db.transaction('meta','readonly');
+  const rq=tx.objectStore('meta').get(k); rq.onsuccess=()=>res(rq.result); rq.onerror=()=>res(undefined); }catch(e){ res(undefined);} }); }
 function idbPut(rec){ return new Promise((res,rej)=>{ const tx=db.transaction('images','readwrite');
   tx.objectStore('images').put(rec); tx.oncomplete=()=>res(); tx.onerror=()=>rej(tx.error); }); }
 function idbAll(){ return new Promise((res,rej)=>{ const tx=db.transaction('images','readonly');
   const rq=tx.objectStore('images').getAll(); rq.onsuccess=()=>res(rq.result||[]); rq.onerror=()=>rej(rq.error); }); }
 function idbClear(){ return new Promise(res=>{ const tx=db.transaction('images','readwrite');
   tx.objectStore('images').clear(); tx.oncomplete=()=>res(); tx.onerror=()=>res(); }); }
-function save(){ try{ localStorage.setItem('apex_poly_labels', JSON.stringify(labels)); savedFlash('Saved ✓'); }catch(e){ savedFlash('⚠️ save failed'); } }
+function save(){
+  if(db){ idbPutMeta('labels', labels).then(()=>savedFlash('Saved ✓')).catch(()=>savedFlash('⚠️ save failed')); }
+  try{ localStorage.setItem('apex_poly_labels', JSON.stringify(labels)); }catch(e){ /* localStorage quota — IndexedDB is now the primary store */ }
+  if(!db) savedFlash('Saved ✓');
+}
 function saveCur(){ try{ localStorage.setItem('apex_cur', cur); }catch(e){} }
 let _flashT=null;
 function savedFlash(msg){ const el=document.getElementById('saved'); if(!el) return;
@@ -477,9 +488,12 @@ function status(){
 }
 // ---------- boot: restore labels + images, then go ----------
 async function boot(){
-  try{ const s=localStorage.getItem('apex_poly_labels'); if(s) labels=JSON.parse(s); }catch(e){}
   ordSeq = +localStorage.getItem('apex_ord') || 0;
   try{ db=await openDB(); }catch(e){ db=null; }
+  // labels: IndexedDB first (large quota); migrate from localStorage if IDB has none yet
+  let lb=null; if(db){ try{ lb=await idbGetMeta('labels'); }catch(e){} }
+  if(lb && typeof lb==='object'){ labels=lb; }
+  else { try{ const s=localStorage.getItem('apex_poly_labels'); if(s) labels=JSON.parse(s); }catch(e){} }
   if(db){
     try{
       const recs=await idbAll(); recs.sort((a,b)=>(a.ord||0)-(b.ord||0));
